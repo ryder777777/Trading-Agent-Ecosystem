@@ -637,6 +637,8 @@ def render_agent_code(genome, name):
     g = genome
     ex = g["exit"]
     op = g["entry"]["op"]; p = g["entry"]["p"]
+    if op not in OPS or not isinstance(p, dict):
+        return f'"""Agent {name} — entry op {op!r} not renderable (skipped)."""\n'
     tpl = OPS[op][1]
     code_line = "    " + tpl.format(**p).replace("; ", "\n    ").replace(";", "\n    ")
     conf_line = ""
@@ -712,16 +714,19 @@ def write_agent_files(top_n=10):
     items = STATE.leaderboard["score"][:top_n]
     idx_line = []
     for i, m in enumerate(items):
-        name = m["genes"].get("_name", f"Agent_top{i:02d}")
-        code = render_agent_code(m["genes"], name)
-        safe = name.replace(" ", "_").replace("/", "_")
-        with open(os.path.join(AGENT_DIR, f"{safe}.py"), "w") as f:
-            f.write(code)
-        g = m["genes"]
-        idx_line.append(f"- `{name}`: entry={g['entry']['op']} "
-                        f"conf={(g.get('conf') or {}).get('op', '-')} "
-                        f"filters={[x['op'] for x in g.get('filters', [])]} "
-                        f"exit={g['exit']} | WR {m['wr']:.1f}% RR {m['rr']:.2f} net ${m['net']:.0f}")
+        try:
+            name = m["genes"].get("_name", f"Agent_top{i:02d}")
+            code = render_agent_code(m["genes"], name)
+            safe = name.replace(" ", "_").replace("/", "_")
+            with open(os.path.join(AGENT_DIR, f"{safe}.py"), "w") as f:
+                f.write(code)
+            g = m["genes"]
+            idx_line.append(f"- `{name}`: entry={g['entry']['op']} "
+                            f"conf={(g.get('conf') or {}).get('op', '-')} "
+                            f"filters={[x['op'] for x in g.get('filters', [])]} "
+                            f"exit={g['exit']} | WR {m['wr']:.1f}% RR {m['rr']:.2f} net ${m['net']:.0f}")
+        except Exception as exc:
+            print(f"[render-skip] {m.get('_name', '?')}: {exc}")
     with open(os.path.join(AGENT_DIR, "INDEX.md"), "w") as f:
         f.write("# Agent Codebase — auto-developed by evolution v3\n\n" + "\n".join(idx_line) + "\n")
 

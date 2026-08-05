@@ -123,3 +123,26 @@ har agent apni alag strategy ke saath (10,000+ agents):
 - macd → RR 4.29 · nr7 → RR 6.43 · boll_mr → WR 53.1%
 
 *Sab conservative P&L, candle-open, no repaint — same benchmark gate.*
+
+---
+
+## 🧬 v3 — UNLIMITED STRATEGY SPACE + SELF-CODING AGENTS (final)
+
+**Genome = variable-length program** (entry primitive + optional confluence + 0-3
+filters + exit SL/TP + risk + cooldown). Mutation adds/removes/rewrites blocks,
+crossover splices programs → **unlimited** strategy combinations from 18 primitives.
+
+**Smart evolution:** tournament selection (k=3) · adaptive mutation rate
+(auto-explore when stuck / exploit when improving) · 10,000-agent live population
+with generational replacement (weakest slots replaced each cycle) · multi-objective
+fitness = net × √PF × WR-boost × RR-boost × volume × DD-penalty.
+
+**Self-coding:** top agents rendered to real Python — `agents/Agent_XXXXX.py`
+(entry signals + exit + filters), INDEX.md with full DNA.
+
+**v3 early results (16 min):**
+- Best WR: **57.7%** (stoch) · Best RR: **10.22** (pinbar) · Best net: **+$22,105** (stoch)
+- 56,000+ unique programs explored · 10,000 agents active
+
+Same honest rules: candle-open entry, no repaint, conservative P&L, benchmark
+gate trades≥3000 & WR≥75% & RR≥3.

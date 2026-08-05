@@ -1,1 +1,1 @@
-{"cycles": 0, "evals": 0, "unique": 40000, "started": 1785931631.9969738, "last_commit": 0, "mut_rate": 0.35, "best_fitness": -1000000000.0, "no_improve": 0}
+{"cycles": 10, "evals": 14638, "unique": 54638, "started": 1785931631.9969738, "last_commit": 0, "mut_rate": 0.18600435000000004, "best_fitness": 14396.629150851359, "no_improve": 0}

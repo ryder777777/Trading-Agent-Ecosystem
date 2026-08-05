@@ -59,15 +59,19 @@ def read_leaderboard():
 # ----------------------------------------------------------------------------
 def fmt_agent(m, idx=0):
     g = m["genes"]
+    strat = g.get("strat", "zones")
+    scfg = g.get("scfg", g.get("mode", ""))
     line = (
-        f"{idx+1}. {g['mode']} | SL={g['sl']}"
-        + (f" (ATR{g['sl_atr']})" if g["sl_atr"] else "")
+        f"{idx+1}. {strat}"
+        + (f" [{scfg}]" if scfg else "")
+        + f" | SL={g['sl']}"
+        + (f" (ATR{g['sl_atr']})" if g.get("sl_atr") else "")
         + f" | TP={g['tp']}" + (f"/RR{g['rr']}" if g["tp"] == "rr" else "")
-        + f" | quiet={g['quiet'] or '-'}"
-        + f" | sess={g['sess'] or '-'}"
-        + f" | ema={g['emaN'] or '-'}"
-        + f" | body={g['body']}"
-        + f" | cool={g['cool']} | risk={g['risk']}\n"
+        + f" | quiet={g.get('quiet') or '-'}"
+        + f" | sess={g.get('sess') or '-'}"
+        + f" | ema={g.get('emaN') or '-'}"
+        + f" | body={g.get('body')}"
+        + f" | cool={g.get('cool')} | risk={g.get('risk')}\n"
         f"    trades={m['trades']} | W={m['wins']} L={m['losses']} | "
         f"WR={m['wr']:.1f}% | PF={m['pf']:.2f} | net=${m['net']:.0f} | "
         f"RR={m['rr']:.2f} | maxDD=${m['maxdd']:.1f}"

@@ -93,3 +93,33 @@ GITHUB_TOKEN=... TG_BOT=... TG_CHAT=... PORT=8080 BATCH=1500 CYCLE_DELAY=5 \
 **Honest metric:** benchmark gate stays at trades≥3000 & WR≥75% & RR≥3 & net>0.
 The engine explores and reports the *real* efficiency frontier — it does not fake
 75%+ WR. Milestone release + broadcast fire only on a verified pass.
+
+---
+
+## 🧬 v2 — DIVERSE STRATEGY SPACE (upgrade)
+
+Ab sirf 8 zone-modes nahi — **22 strategy families** explore ho rahi hain,
+har agent apni alag strategy ke saath (10,000+ agents):
+
+| Family | Type | Examples |
+|---|---|---|
+| zones (aapki logic) | POI zones | SUPER_LOOSE etc. (8 modes) |
+| ema_cross / sma_cross / macd / supertrend | Trend following | fast/slow cross |
+| rsi_mr / rsi_mom / boll_mr / donchian_mr | Mean reversion | oversold/overbought |
+| donchian_break / boll_break / atr_break | Breakout | N-bar highs/lows |
+| roc / roc_zero | Momentum | ROC thresholds |
+| engulfing / pinbar / insidebar / nr7 / doji_rev | Candle patterns | reversal signals |
+| ma_pullback / trend_pullback | Pullback | EMA/SMA dips |
+
+- `strategies.py` — 21 vectorized non-repainting signal generators
+- `precompute_signals.py` — 147 signal files (strat × config × year), candle-open entry
+- `signals/` — precomputed signal CSVs (non-repainting, entry at next open)
+- Genome = (strat, config) + exits (SL/ATR-SL, TP close/RR) + filters + risk
+- Dashboard ab strategy family dikhata hai
+
+**v2 early results (10 min exploration):**
+- stoch → net +$16,322 · PF 1.30 (325k trades)
+- donchian_mr → +$2,253 · PF 1.41
+- macd → RR 4.29 · nr7 → RR 6.43 · boll_mr → WR 53.1%
+
+*Sab conservative P&L, candle-open, no repaint — same benchmark gate.*

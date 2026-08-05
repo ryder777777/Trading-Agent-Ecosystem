@@ -1,14 +1,18 @@
 """
-AUTONOMOUS EVOLUTION ENGINE — 24h self-improving backtest loop.
+AUTONOMOUS EVOLUTION ENGINE v2 — DIVERSIFIED STRATEGY SPACE.
 
-Agents (genomes) evolve continuously:
-  - every cycle: elite selection -> crossover + mutation (code mutation) + exploration
-  - each genome evaluated on 1.06M real GOLD M1 candles (candle-open, conservative P&L)
-  - registry keeps best-known strategies; leaderboards by WR / PF / net / RR / score
-  - periodic GitHub auto-commit + Telegram digest + milestone broadcast
-  - live HTTP dashboard with progress
+Genome now = (strategy family, config) + exits + filters:
+  strat : "zones" (original 8 modes) OR any of 21 library strategies
+          (ema_cross, sma_cross, rsi_mr, rsi_mom, macd, stoch, boll_mr,
+           boll_break, donchian_break, donchian_mr, atr_break, roc, roc_zero,
+           supertrend, engulfing, pinbar, insidebar, nr7, ma_pullback,
+           trend_pullback, doji_rev)
+  scfg  : config id within that strategy
+  exits : sl (fixed / ATR), tp (close / fixed-RR 2-10x), filters (quiet, sess,
+          c1dir, emaN, body), cooldown, risk.
 
-Resumable: state saved every commit; restart continues where it left off.
+Every agent has its own strategy + parameters. Signals are precomputed
+(non-repainting, candle-open entry) and cached. Conservative P&L.
 """
 import json
 import math
@@ -32,10 +36,17 @@ DATA_PATHS = {
     "2025": "/home/user/uploads/GOLD.i#_M1 2025 to 2026.csv",
 }
 SIG_DIR = "/home/user/all_modes"
+LIB_SIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signals")
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EVO_DIR = os.path.join(ROOT, "evolution")
-MODES = ["SUPER_LOOSE", "SUPER_LOOSE_2", "Sw0.6_Wi1.2", "Sw0.4_Wi0.8",
-         "ORIGINAL", "VeryTight", "Triple_Med", "AGGRESSIVE"]
+
+# strategy families: "zones" = original logic; rest = library
+ZONE_MODES = ["SUPER_LOOSE", "SUPER_LOOSE_2", "Sw0.6_Wi1.2", "Sw0.4_Wi0.8",
+              "ORIGINAL", "VeryTight", "Triple_Med", "AGGRESSIVE"]
+from strategies import STRATS, STRAT_NAMES, strat_cfgs
+
+STRAT_FAMILIES = ["zones"] + STRAT_NAMES
+
 SESSIONS = {
     "london_ny": {8, 9, 10, 11, 12, 13, 14, 15, 16},
     "asia": {0, 1, 2, 3, 4, 5, 6, 7},
@@ -43,10 +54,10 @@ SESSIONS = {
     "london": {8, 9, 10, 11, 12, 13, 14, 15},
 }
 BENCH_TRADES, BENCH_WR, BENCH_RR = 3000, 75.0, 3.0
-OBJ_LIST = ["score", "wr", "pf", "rr"]   # rotating optimization objectives
+OBJ_LIST = ["score", "wr", "pf", "rr"]
 
 # ----------------------------------------------------------------------------
-# PRECOMPUTE (per year): OHLC + features + signals
+# PRECOMPUTE features (per year)
 # ----------------------------------------------------------------------------
 PREC = None
 
@@ -64,6 +75,18 @@ def _atr(h, l, c, n=14):
         tr = max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1]))
         out[i] = tr if i < n else (out[i-1]*(n-1)+tr)/n
     return out
+
+def _load_sig_csv(path):
+    rows = []
+    with open(path) as f:
+        rd = iter(f); next(rd)
+        for line in rd:
+            p = line.rstrip().split(",")
+            rows.append((int(p[0]), 0 if p[2] == "BUY" else 1))
+    if not rows:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+    arr = np.array(rows)
+    return arr[:, 0].astype(np.int64), arr[:, 1].astype(np.int64)
 
 def precompute():
     global PREC
@@ -83,50 +106,70 @@ def precompute():
         hour = np.array([int(x.split(" ")[1].split(":")[0]) for x in t])
         r1 = h - l
         dir_bull = c > o
+        # signals: key = (strat, scfg)
         sigs = {}
-        for m in MODES:
-            rows = []
-            with open(os.path.join(SIG_DIR, f"backtest_{m}_{y}.csv")) as f:
-                rd = iter(f); next(rd)
-                for line in rd:
-                    p = line.rstrip().split(",")
-                    rows.append((int(p[0]), 0 if p[2] == "BUY" else 1))
-            if rows:
-                arr = np.array(rows)
-                sigs[m] = (arr[:, 0].astype(np.int64), arr[:, 1].astype(np.int64))
+        for m in ZONE_MODES:
+            pth = os.path.join(SIG_DIR, f"backtest_{m}_{y}.csv")
+            if os.path.exists(pth):
+                sigs[("zones", m)] = _load_sig_csv(pth)
+        for name in STRAT_NAMES:
+            for ci, cfg in enumerate(strat_cfgs(name)):
+                cid = cfg_id(cfg)
+                pth = os.path.join(LIB_SIG_DIR, f"{name}__{cid}__{y}.csv")
+                if os.path.exists(pth):
+                    sigs[(name, cid)] = _load_sig_csv(pth)
         P[y] = dict(o=o, h=h, l=l, c=c, hour=hour, r1=r1, dir_bull=dir_bull,
                     atr=_atr(h, l, c), sigs=sigs,
                     ema_ok={n: (c > _ema(c, n)) for n in (50, 100, 200)})
     PREC = P
     return P
 
+def cfg_id(cfg):
+    return json.dumps(cfg, sort_keys=True).replace(" ", "").replace('"', "").replace("{", "").replace("}", "").replace(":", "=").replace(",", "_")
+
 # ----------------------------------------------------------------------------
-# GENOME (DNA) + operators
+# GENOME + operators
 # ----------------------------------------------------------------------------
 def random_genome(rng):
+    strat = rng.choice(STRAT_FAMILIES)
+    if strat == "zones":
+        scfg = rng.choice(ZONE_MODES)
+    else:
+        cfg = rng.choice(strat_cfgs(strat))
+        scfg = cfg_id(cfg)
     return dict(
-        mode=rng.choice(MODES),
+        strat=strat, scfg=scfg,
         sl=round(rng.uniform(0.3, 6.0), 2),
-        sl_atr=rng.choice([None, None, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0]),
+        sl_atr=rng.choice([None, None, None, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0]),
         tp=rng.choice(["close", "rr"]),
         rr=round(rng.uniform(2.0, 10.0), 1),
-        quiet=rng.choice([None, None, round(rng.uniform(0.4, 3.0), 2)]),
-        sess=rng.choice([None, "london_ny", "asia", "ny", "london"]),
-        c1dir=bool(rng.random() < 0.3),
-        emaN=rng.choice([None, None, None, 50, 100, 200]),
-        body=round(rng.choice([0.0, 0.0, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0]), 2),
-        cool=rng.choice([0, 0, 0, 0, 1, 2]),
+        quiet=rng.choice([None, None, None, round(rng.uniform(0.4, 3.0), 2)]),
+        sess=rng.choice([None, None, None, "london_ny", "asia", "ny", "london"]),
+        c1dir=bool(rng.random() < 0.15),
+        emaN=rng.choice([None, None, None, None, 50, 100, 200]),
+        body=round(rng.choice([0.0, 0.0, 0.0, 0.0, 0.2, 0.4, 0.6, 0.8]), 2),
+        cool=rng.choice([0, 0, 0, 0, 0, 1, 2]),
         risk=rng.choice([0.25, 0.5, 0.75, 1.0]),
         seed=rng.randint(0, 2**31),
     )
 
 def signature(g):
-    return (g["mode"], g["sl"], g["sl_atr"], g["tp"], g["rr"], g["quiet"],
-            g["sess"], g["c1dir"], g["emaN"], g["body"], g["cool"], g["risk"])
+    return (g["strat"], g["scfg"], g["sl"], g["sl_atr"], g["tp"], g["rr"],
+            g["quiet"], g["sess"], g["c1dir"], g["emaN"], g["body"],
+            g["cool"], g["risk"])
+
+def _rand_scfg(rng, strat):
+    if strat == "zones":
+        return rng.choice(ZONE_MODES)
+    return cfg_id(rng.choice(strat_cfgs(strat)))
 
 def mutate(g, rng):
     ng = dict(g)
-    if rng.random() < 0.08: ng["mode"] = rng.choice(MODES)
+    if rng.random() < 0.05:
+        ng["strat"] = rng.choice(STRAT_FAMILIES)
+        ng["scfg"] = _rand_scfg(rng, ng["strat"])
+    elif rng.random() < 0.2:
+        ng["scfg"] = _rand_scfg(rng, ng["strat"])
     if rng.random() < 0.3: ng["sl"] = round(max(0.3, min(6.0, ng["sl"] + rng.uniform(-0.5, 0.5))), 2)
     if rng.random() < 0.1: ng["sl_atr"] = rng.choice([None, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0])
     if rng.random() < 0.2: ng["tp"] = rng.choice(["close", "rr"])
@@ -142,10 +185,14 @@ def mutate(g, rng):
     return ng
 
 def crossover(a, b, rng):
-    keys = ["mode", "sl", "sl_atr", "tp", "rr", "quiet", "sess", "c1dir",
-            "emaN", "body", "cool", "risk"]
     ng = {}
-    for k in keys:
+    # strategy part from one parent (don't mix incompatible strategies)
+    if rng.random() < 0.5:
+        ng["strat"] = a["strat"]; ng["scfg"] = a["scfg"]
+    else:
+        ng["strat"] = b["strat"]; ng["scfg"] = b["scfg"]
+    for k in ["sl", "sl_atr", "tp", "rr", "quiet", "sess", "c1dir", "emaN",
+              "body", "cool", "risk"]:
         ng[k] = a[k] if rng.random() < 0.5 else b[k]
     ng["seed"] = rng.randint(0, 2**31)
     return ng
@@ -157,15 +204,15 @@ def eval_genome(g):
     P = PREC
     parts = []
     for y in YEARS:
-        sig = P[y]["sigs"].get(g["mode"])
-        if not sig:
+        sig = P[y]["sigs"].get((g["strat"], g["scfg"]))
+        if sig is None or len(sig[0]) == 0:
             continue
         idx, side = sig
         m = np.ones(len(idx), bool)
         if g["quiet"] is not None:
             m &= P[y]["r1"][idx - 1] <= g["quiet"]
         if g["sess"]:
-            m &= np.isin(P[y]["hour"][idx], SESSIONS[g["sess"]])
+            m &= np.isin(P[y]["hour"][idx], list(SESSIONS[g["sess"]]))
         if g["c1dir"]:
             m &= (P[y]["dir_bull"][idx - 1] == (side == 0))
         if g["emaN"]:
@@ -198,12 +245,10 @@ def eval_genome(g):
         return None
     pnl = np.concatenate(parts)
     if g["cool"] > 0:
-        keep = []
-        skip = 0
+        keep = []; skip = 0
         for p in pnl:
             if skip > 0:
-                skip -= 1
-                continue
+                skip -= 1; continue
             keep.append(p)
             if p < 0:
                 skip = g["cool"]
@@ -233,12 +278,12 @@ def score(m):
     return m["net"] * vol * dd_pen * math.sqrt(m["pf"])
 
 # ----------------------------------------------------------------------------
-# STATE / PERSISTENCE
+# STATE
 # ----------------------------------------------------------------------------
 class State:
     def __init__(self):
-        self.registry = {}          # sig -> metrics
-        self.population = []        # [(sig, score)]
+        self.registry = {}
+        self.population = []
         self.leaderboard = {o: [] for o in ["score", "wr", "pf", "rr", "net"]}
         self.cycles = 0
         self.evals = 0
@@ -246,8 +291,7 @@ class State:
         self.benchmark_hits = []
         self.started = time.time()
         self.last_commit = 0
-        self.last_digest = 0
-        self.history = []           # cycle summaries (small)
+        self.history = []
         self.lock = threading.Lock()
 
 STATE = State()
@@ -257,11 +301,10 @@ def save_state():
     with STATE.lock:
         top = sorted(STATE.registry.items(), key=lambda kv: -score(kv[1]))[:20000]
         with open(os.path.join(EVO_DIR, "registry_top.json"), "w") as f:
-            json.dump([{ "sig": list(k), "m": v } for k, v in top], f)
+            json.dump([{"sig": list(k), "m": v} for k, v in top], f)
         with open(os.path.join(EVO_DIR, "state.json"), "w") as f:
             json.dump(dict(cycles=STATE.cycles, evals=STATE.evals,
-                           unique=STATE.unique,
-                           started=STATE.started,
+                           unique=STATE.unique, started=STATE.started,
                            last_commit=STATE.last_commit), f)
         with open(os.path.join(EVO_DIR, "leaderboard.json"), "w") as f:
             json.dump(STATE.leaderboard, f)
@@ -282,7 +325,12 @@ def load_state():
         with open(os.path.join(EVO_DIR, "registry_top.json")) as f:
             data = json.load(f)
         for item in data:
-            STATE.registry[tuple(item["sig"])] = item["m"]
+            m = item["m"]
+            # migrate old-format genes (mode) -> zones
+            if "strat" not in m.get("genes", {}):
+                m["genes"]["strat"] = "zones"
+                m["genes"]["scfg"] = m["genes"].get("mode", "SUPER_LOOSE")
+            STATE.registry[tuple(item["sig"])] = m
         STATE.population = sorted(
             ((k, score(m)) for k, m in STATE.registry.items()),
             key=lambda kv: -kv[1])[:200]
@@ -307,22 +355,20 @@ def make_charts():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     os.makedirs(EVO_DIR, exist_ok=True)
-    # 1) leaderboard WR/PF bars
     items = [m for m in STATE.registry.values() if m["trades"] >= 1000]
     if items:
         fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 4.5))
         top = sorted(items, key=lambda m: -m["wr"])[:8]
-        a1.barh([t["genes"]["mode"] + " sl" + str(t["genes"]["sl"]) for t in top][::-1],
+        a1.barh([t["genes"]["strat"] for t in top][::-1],
                 [t["wr"] for t in top][::-1], color="#4da3ff")
-        a1.set_title(f"Top WR (>=1000 trades) — best {top[0]['wr']:.1f}%")
+        a1.set_title(f"Top WR — best {top[0]['wr']:.1f}%")
         top = sorted(items, key=lambda m: -m["pf"])[:8]
-        a2.barh([t["genes"]["mode"] + " sl" + str(t["genes"]["sl"]) for t in top][::-1],
+        a2.barh([t["genes"]["strat"] for t in top][::-1],
                 [t["pf"] for t in top][::-1], color="#6bff8f")
         a2.set_title(f"Top PF — best {top[0]['pf']:.2f}")
         plt.tight_layout()
         plt.savefig(os.path.join(EVO_DIR, "leaderboard.png"), dpi=100)
         plt.close()
-    # 2) history: best score over time
     if len(STATE.history) >= 2:
         xs = [h["cycle"] for h in STATE.history]
         ys = [h["best_score"] for h in STATE.history]
@@ -335,7 +381,7 @@ def make_charts():
         plt.close()
 
 # ----------------------------------------------------------------------------
-# GITHUB AUTO-COMMIT
+# GIT / TG
 # ----------------------------------------------------------------------------
 def git_commit():
     token = os.environ.get("GITHUB_TOKEN", "")
@@ -345,29 +391,23 @@ def git_commit():
         subprocess.run("git add -A", shell=True, cwd=ROOT, capture_output=True)
         subprocess.run(f"git -c user.name='AgentEvo' -c user.email='evo@local' "
                        f"commit -m 'evolution cycle {STATE.cycles}: {STATE.unique} unique "
-                       f"strategies, best WR {STATE.leaderboard['wr'][0]['wr'] if STATE.leaderboard['wr'] else 0:.1f}%'",
+                       f"strategies across {len(STRAT_FAMILIES)} families'",
                        shell=True, cwd=ROOT, capture_output=True)
-        out = subprocess.run(
+        return subprocess.run(
             f"git push https://x-access-token:{token}@github.com/ryder777777/"
             f"Trading-Agent-Ecosystem.git main",
-            shell=True, cwd=ROOT, capture_output=True, text=True)
-        STATE.last_commit = time.time()
-        return out.returncode
-    except Exception as e:
+            shell=True, cwd=ROOT, capture_output=True, text=True).returncode
+    except Exception:
         return None
 
-# ----------------------------------------------------------------------------
-# TELEGRAM
-# ----------------------------------------------------------------------------
 def tg_send(text):
     token = os.environ.get("TG_BOT", ""); chat = os.environ.get("TG_CHAT", "")
     if not token or not chat:
         return False
     try:
         import requests
-        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                          json={"chat_id": chat, "text": text}, timeout=10)
-        return r.ok
+        return requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                             json={"chat_id": chat, "text": text}, timeout=10).ok
     except Exception:
         return False
 
@@ -378,14 +418,14 @@ def digest_text():
         best_pf = lb["pf"][0] if lb["pf"] else None
         best_net = lb["net"][0] if lb["net"] else None
     lines = [
-        "🧬 Agent Ecosystem — EVOLUTION UPDATE",
+        "🧬 Agent Ecosystem — EVOLUTION UPDATE (diverse strategies)",
         f"⏱ uptime: {(time.time()-STATE.started)/3600:.1f}h | cycles: {STATE.cycles} | "
         f"evaluations: {STATE.evals:,} | unique: {STATE.unique:,}",
+        f"🎯 strategy families explored: {len(STRAT_FAMILIES)} (zones + library)",
     ]
     if best_wr:
         lines.append(f"🏆 best WR: {best_wr['wr']:.1f}% ({best_wr['trades']} trades) "
-                     f"[{best_wr['genes']['mode']} sl={best_wr['genes']['sl']} "
-                     f"quiet={best_wr['genes']['quiet']}]")
+                     f"[{best_wr['genes']['strat']}]")
     if best_pf:
         lines.append(f"💰 best PF: {best_pf['pf']:.2f} ({best_pf['trades']} trades)")
     if best_net:
@@ -397,7 +437,7 @@ def digest_text():
 # ----------------------------------------------------------------------------
 # CYCLE
 # ----------------------------------------------------------------------------
-def one_cycle(rng, batch, objective):
+def one_cycle(rng, batch):
     new_evaled = 0
     candidates = []
     elites = [sig for sig, _ in sorted(STATE.population, key=lambda kv: -kv[1])[:40]]
@@ -445,56 +485,58 @@ def one_cycle(rng, batch, objective):
     return new_evaled
 
 # ----------------------------------------------------------------------------
-# STATUS SERVER (live dashboard)
+# DASHBOARD
 # ----------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
     def do_GET(self):
         if self.path.startswith("/status.json"):
-            self._json()
+            body = json.dumps(dict(
+                uptime=time.time() - STATE.started, cycles=STATE.cycles,
+                evals=STATE.evals, unique=STATE.unique,
+                benchmark=len(STATE.benchmark_hits),
+                families=len(STRAT_FAMILIES),
+                leaderboard={o: [{"strat": m["genes"]["strat"],
+                                  "wr": m["wr"], "pf": m["pf"], "net": m["net"],
+                                  "trades": m["trades"], "rr": m["rr"],
+                                  "sl": m["genes"]["sl"], "quiet": m["genes"]["quiet"],
+                                  "sess": m["genes"]["sess"], "scfg": m["genes"]["scfg"]}
+                                 for m in STATE.leaderboard[o][:5]]
+                             for o in ["score", "wr", "pf", "net", "rr"]},
+                last_commit=STATE.last_commit)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
         else:
-            self._html()
-    def _json(self):
-        body = json.dumps(dict(
-            uptime=time.time() - STATE.started, cycles=STATE.cycles,
-            evals=STATE.evals, unique=STATE.unique,
-            benchmark=len(STATE.benchmark_hits),
-            leaderboard={o: [{ "wr": m["wr"], "pf": m["pf"], "net": m["net"],
-                               "trades": m["trades"], "rr": m["rr"],
-                               "mode": m["genes"]["mode"], "sl": m["genes"]["sl"],
-                               "quiet": m["genes"]["quiet"],
-                               "sess": m["genes"]["sess"] }
-                            for m in STATE.leaderboard[o][:5]]
-                         for o in ["score", "wr", "pf", "net", "rr"]},
-            last_commit=STATE.last_commit)).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(body)
-    def _html(self):
-        html = _dashboard_html()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(html.encode())
+            html = _dashboard_html()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode())
 
 def _dashboard_html():
     lb = STATE.leaderboard
-    def row(m, tag=""):
-        return (f"<tr><td>{m['genes']['mode']}</td><td>{m['genes']['sl']}</td>"
-                f"<td>{m['genes']['sl_atr'] or '-'}</td><td>{m['genes']['quiet'] or '-'}</td>"
-                f"<td>{m['genes']['sess'] or '-'}</td><td>{m['genes']['emaN'] or '-'}</td>"
-                f"<td>{m['trades']}</td><td>{m['wr']:.1f}%</td><td>{m['pf']:.2f}</td>"
-                f"<td>${m['net']:.0f}</td><td>{m['rr']:.2f}</td>{tag}</tr>")
-    rows_wr = "".join(row(m) for m in lb["wr"][:8]) or "<tr><td colspan=11>—</td></tr>"
-    rows_score = "".join(row(m) for m in lb["score"][:8]) or "<tr><td colspan=11>—</td></tr>"
-    rows_pf = "".join(row(m) for m in lb["pf"][:8]) or "<tr><td colspan=11>—</td></tr>"
+    def row(m):
+        return (f"<tr><td>{m['genes']['strat']}</td>"
+                f"<td>{m['genes']['scfg']}</td>"
+                f"<td>{m['genes']['sl']}</td>"
+                f"<td>{m['genes']['sl_atr'] or '-'}</td>"
+                f"<td>{m['genes']['tp']}/{m['genes']['rr']}</td>"
+                f"<td>{m['genes']['quiet'] or '-'}</td>"
+                f"<td>{m['genes']['sess'] or '-'}</td>"
+                f"<td>{m['genes']['emaN'] or '-'}</td>"
+                f"<td>{m['trades']}</td><td>{m['wr']:.1f}%</td>"
+                f"<td>{m['pf']:.2f}</td><td>${m['net']:.0f}</td>"
+                f"<td>{m['rr']:.2f}</td></tr>")
+    rows_wr = "".join(row(m) for m in lb["wr"][:8]) or "<tr><td colspan=13>—</td></tr>"
+    rows_score = "".join(row(m) for m in lb["score"][:8]) or "<tr><td colspan=13>—</td></tr>"
+    rows_pf = "".join(row(m) for m in lb["pf"][:8]) or "<tr><td colspan=13>—</td></tr>"
     up = (time.time() - STATE.started) / 3600
     next_commit = max(0, 900 - (time.time() - STATE.last_commit)) if STATE.last_commit else 0
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<meta http-equiv="refresh" content="10">
-<title>Agent Ecosystem — Evolution Live</title>
+<meta http-equiv="refresh" content="10"><title>Agent Ecosystem — Evolution v2</title>
 <style>
  body{{font-family:Arial,sans-serif;background:#0e1117;color:#e6e6e6;margin:0;padding:20px}}
  h1{{font-size:22px;color:#ff9f43}} .cards{{display:flex;gap:14px;flex-wrap:wrap;margin:14px 0}}
@@ -506,60 +548,61 @@ def _dashboard_html():
  h2{{font-size:16px;color:#4da3ff;margin-top:22px}}
  .note{{color:#8b949e;font-size:12px;margin-top:20px;line-height:1.6}}
 </style></head><body>
-<h1>🧬 Agent Ecosystem — Evolution Engine (LIVE)</h1>
+<h1>🧬 Agent Ecosystem — Evolution v2 (DIVERSE strategies) LIVE</h1>
 <div class="cards">
  <div class="card"><b>{up:.1f}h</b><span>uptime</span></div>
  <div class="card"><b>{STATE.cycles:,}</b><span>cycles</span></div>
  <div class="card"><b>{STATE.evals:,}</b><span>evaluations</span></div>
  <div class="card"><b>{STATE.unique:,}</b><span>unique strategies</span></div>
+ <div class="card"><b>{len(STRAT_FAMILIES)}</b><span>strategy families</span></div>
  <div class="card"><b>{len(STATE.benchmark_hits)}</b><span>benchmark passes</span></div>
  <div class="card"><b>{int(next_commit)}s</b><span>next GitHub commit</span></div>
 </div>
 <h2>🏆 Best by Win Rate (>=500 trades)</h2>
-<table><tr><th>mode</th><th>SL</th><th>SL-ATR</th><th>quiet</th><th>sess</th><th>EMA</th>
+<table><tr><th>strat</th><th>cfg</th><th>SL</th><th>SL-ATR</th><th>TP/RR</th><th>quiet</th><th>sess</th><th>EMA</th>
 <th>trades</th><th>WR</th><th>PF</th><th>net</th><th>RR</th></tr>{rows_wr}</table>
 <h2>🎯 Best overall (score)</h2>
-<table><tr><th>mode</th><th>SL</th><th>SL-ATR</th><th>quiet</th><th>sess</th><th>EMA</th>
+<table><tr><th>strat</th><th>cfg</th><th>SL</th><th>SL-ATR</th><th>TP/RR</th><th>quiet</th><th>sess</th><th>EMA</th>
 <th>trades</th><th>WR</th><th>PF</th><th>net</th><th>RR</th></tr>{rows_score}</table>
 <h2>💰 Best Profit Factor</h2>
-<table><tr><th>mode</th><th>SL</th><th>SL-ATR</th><th>quiet</th><th>sess</th><th>EMA</th>
+<table><tr><th>strat</th><th>cfg</th><th>SL</th><th>SL-ATR</th><th>TP/RR</th><th>quiet</th><th>sess</th><th>EMA</th>
 <th>trades</th><th>WR</th><th>PF</th><th>net</th><th>RR</th></tr>{rows_pf}</table>
-<div class="note">Conservative P&L (both TP+SL touch ⇒ SL first) · candle-open entries · no repaint ·
-1.06M GOLD M1 candles (2023-2026). Charts + full logs: github.com/ryder777777/Trading-Agent-Ecosystem/evolution/</div>
+<div class="note">22 strategy families: zones (aapki logic) + ema/sma cross, rsi (mr+mom), macd, stoch,
+bollinger (mr+break), donchian (break+mr), atr break, roc, supertrend, engulfing, pinbar, insidebar,
+nr7, ma/trend pullback, doji. Candle-open entry, no repaint, conservative P&L, 1.06M GOLD M1 candles.
+Charts + logs: github.com/ryder777777/Trading-Agent-Ecosystem/evolution/</div>
 </body></html>"""
 
 def status_server():
     port = int(os.environ.get("PORT", "8080"))
-    srv = HTTPServer(("0.0.0.0", port), Handler)
-    srv.serve_forever()
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 # ----------------------------------------------------------------------------
-# MAIN LOOP
+# MAIN
 # ----------------------------------------------------------------------------
 def main():
     precompute()
     load_state()
     os.makedirs(EVO_DIR, exist_ok=True)
 
-    # seed population with known good strategies if registry empty
     if not STATE.registry:
         rng = random.Random(7)
         seeds = [
-            dict(mode="SUPER_LOOSE", sl=1.5, sl_atr=None, tp="close", rr=4.0,
-                 quiet=None, sess=None, c1dir=False, emaN=None, body=0.0,
+            dict(strat="zones", scfg="SUPER_LOOSE", sl=1.5, sl_atr=None, tp="close",
+                 rr=4.0, quiet=None, sess=None, c1dir=False, emaN=None, body=0.0,
                  cool=0, risk=1.0, seed=1),
-            dict(mode="SUPER_LOOSE", sl=1.5, sl_atr=None, tp="close", rr=4.0,
-                 quiet=1.0, sess=None, c1dir=False, emaN=None, body=0.0,
+            dict(strat="zones", scfg="SUPER_LOOSE", sl=1.5, sl_atr=None, tp="close",
+                 rr=4.0, quiet=1.0, sess=None, c1dir=False, emaN=None, body=0.0,
                  cool=0, risk=1.0, seed=2),
-            dict(mode="SUPER_LOOSE", sl=0.5, sl_atr=None, tp="close", rr=4.0,
-                 quiet=None, sess=None, c1dir=False, emaN=None, body=0.0,
+            dict(strat="zones", scfg="SUPER_LOOSE", sl=0.5, sl_atr=None, tp="close",
+                 rr=4.0, quiet=None, sess=None, c1dir=False, emaN=None, body=0.0,
                  cool=0, risk=1.0, seed=3),
         ]
         for g in seeds:
             m = eval_genome(g)
             if m:
                 STATE.registry[signature(g)] = m
-        for _ in range(300):
+        for _ in range(600):
             g = random_genome(rng)
             if signature(g) in STATE.registry:
                 continue
@@ -576,16 +619,15 @@ def main():
 
     rng = random.Random(int(time.time()))
     batch = int(os.environ.get("BATCH", "1500"))
-    cycle_delay = float(os.environ.get("CYCLE_DELAY", "8"))
+    cycle_delay = float(os.environ.get("CYCLE_DELAY", "5"))
     commit_every = int(os.environ.get("COMMIT_EVERY", "900"))
     digest_every = int(os.environ.get("DIGEST_EVERY", "7200"))
 
-    # startup: immediate commit + digest
     make_charts(); save_state()
     git_commit()
-    tg_send("🧬 Agent Ecosystem evolution engine STARTED.\n"
-            "24h continuous backtest + self-improvement loop live.\n"
-            "Dashboard + logs: github.com/ryder777777/Trading-Agent-Ecosystem")
+    tg_send("🧬 Agent Ecosystem v2 STARTED — DIVERSE strategy space.\n"
+            "22 strategy families (zones + 21 library) × continuous evolution.\n"
+            "github.com/ryder777777/Trading-Agent-Ecosystem")
     print("[startup] committed + notified")
 
     last_commit = time.time()
@@ -595,8 +637,8 @@ def main():
         try:
             obj = OBJ_LIST[obj_idx % len(OBJ_LIST)]
             obj_idx += 1
-            new = one_cycle(rng, batch, obj)
-            if new > 0 and (STATE.cycles % 10 == 0):
+            _ = one_cycle(rng, batch)
+            if STATE.cycles % 10 == 0:
                 make_charts(); save_state()
             if time.time() - last_commit >= commit_every:
                 make_charts(); save_state(); git_commit()

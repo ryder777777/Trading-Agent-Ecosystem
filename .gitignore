@@ -1,4 +1,2 @@
-*.csv
-!reports/*.csv
 __pycache__/
 .env

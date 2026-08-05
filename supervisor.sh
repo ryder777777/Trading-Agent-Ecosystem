@@ -18,7 +18,7 @@ echo "[supervisor] starting at $(date)"
 (
   while true; do
     echo "[supervisor] evolution start $(date)"
-    python3 -u evolution.py
+    python3 -u evolution_v3.py
     echo "[supervisor] evolution EXITED rc=$? -> restart in 5s"
     sleep 5
   done

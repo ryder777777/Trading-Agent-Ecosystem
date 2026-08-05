@@ -185,9 +185,11 @@ def main():
                 if not msg:
                     continue
                 chat = str(msg["chat"]["id"])
+                text = (msg.get("text") or "").strip()
+                print(f"[tg] recv chat={chat} type={msg.get('chat',{}).get('type','?')} "
+                      f"text={text[:40]!r} allowed={chat == str(ALLOWED)}")
                 if chat != str(ALLOWED):
                     continue
-                text = (msg.get("text") or "").strip()
                 if not text:
                     continue
                 cmd = text.split()[0].lower()

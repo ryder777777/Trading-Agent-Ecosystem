@@ -247,6 +247,37 @@ def emotional_pass(d, pnl):
     return float(np.array(out).sum()) - float(np.array(trades).sum())
 
 # ----------------------------------------------------------------------------
+# MILESTONE RELEASE HOOK (GitHub) — fires when an agent crosses the benchmark
+# ----------------------------------------------------------------------------
+def release_agent(agent, token=None):
+    """Create a GitHub release titled with agent name + WR metric, e.g.
+    'Agent_00001-v1-WR82-RR1x4'. Returns release url or None."""
+    import subprocess
+    tok = token or os.environ.get("GITHUB_TOKEN", "")
+    if not tok:
+        return None
+    name = agent["name"]
+    wr = int(round(agent["wr"]))
+    rr = agent.get("rr", 1)
+    tag = f"{name}-v1-WR{wr}-RR1x{rr:.0f}".replace(".", "x") if rr else f"{name}-v1-WR{wr}"
+    repo = "ryder777777/Trading-Agent-Ecosystem"
+    body = (f"Agent {name} crossed benchmark!\n"
+            f"Trades: {agent['trades']} | WR: {agent['wr']}% | RR: {agent['rr']}\n"
+            f"Net: ${agent['net']} | PF: {agent['pf']}\n"
+            f"DNA: {json.dumps({k: agent[k] for k in ('mode','quiet_cap','session','c1_dir','ema_align','sl','tp_mode','rr')})}")
+    payload = json.dumps({"tag_name": tag, "name": tag, "body": body,
+                          "target_commitish": "main"})
+    cmd = (f"curl -s -X POST -H 'Authorization: Bearer {tok}' "
+           f"-H 'Accept: application/vnd.github+json' "
+           f"-d '{payload}' https://api.github.com/repos/{repo}/releases")
+    out = subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout
+    try:
+        return json.loads(out).get("html_url")
+    except Exception:
+        return None
+
+
+# ----------------------------------------------------------------------------
 # RUNNER
 # ----------------------------------------------------------------------------
 def run_cohort(n_agents, workers=2, seed=42):
@@ -276,6 +307,9 @@ def run_cohort(n_agents, workers=2, seed=42):
 
     bench = [r for r in results if r["benchmark"]]
     print(f"[cohort] {n_agents} agents | {dt:.0f}s | benchmark pass: {len(bench)}")
+    for b in bench:
+        url = release_agent(b)
+        print(f"[MILESTONE] {b['name']} WR{b['wr']}% RR{b['rr']} -> release: {url}")
     return results, bench, dt
 
 if __name__ == "__main__":

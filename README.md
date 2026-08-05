@@ -64,3 +64,32 @@ python3 analyze.py                               # analysis + charts
 
 *No secrets are stored in this repo. The private strategy logic (SECRET_LOGIC_B64)
 stays on Render / local only.*
+
+---
+
+## 🧬 Autonomous Evolution Engine (24h loop)
+
+`evolution.py` — a continuous self-improving backtest loop:
+
+- **Every cycle:** elite selection → crossover + mutation (code mutation) + random
+  exploration → new genomes evaluated on 1.06M GOLD M1 candles.
+- **Genome space:** mode, SL (fixed or ATR-based), TP (close / fixed-RR 2-10x),
+  quiet-C1 filter, session window, C1 direction, EMA50/100/200 alignment, body
+  filter, cooldown-after-loss, risk sizing.
+- **Rotating objectives:** score / WR / PF / RR — agents compete on different goals.
+- **Persistence (no ephemeral storage):** every 15 min auto-commits to GitHub
+  (`evolution/` — registry, leaderboard, charts, state) + Telegram digest every 2h
+  + instant milestone broadcast (WR≥75% & RR≥3 & ≥3,000 trades).
+- **Resumable:** state.json + registry_top.json → restart continues from last commit.
+- **Live dashboard:** HTTP server (PORT=8080) shows uptime / cycles / evals /
+  leaderboards — auto-refreshing.
+
+### Run
+```bash
+GITHUB_TOKEN=... TG_BOT=... TG_CHAT=... PORT=8080 BATCH=1500 CYCLE_DELAY=5 \
+  COMMIT_EVERY=900 DIGEST_EVERY=7200 python3 -u evolution.py
+```
+
+**Honest metric:** benchmark gate stays at trades≥3000 & WR≥75% & RR≥3 & net>0.
+The engine explores and reports the *real* efficiency frontier — it does not fake
+75%+ WR. Milestone release + broadcast fire only on a verified pass.
